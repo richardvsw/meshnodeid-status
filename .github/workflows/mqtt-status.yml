@@ -1,0 +1,96 @@
+name: Check MQTT broker status
+
+on:
+  # External cron calls workflow_dispatch on its own schedule (fallback
+  # poll — the LXC-side timer is the primary publisher, see
+  # deploy/systemd/run_and_push.sh).
+  workflow_dispatch: {}
+  # 2026-08-25: EMQX's rule engine (Client Connected/Disconnected +
+  # System Alarm Activated/Deactivated events) fires this directly via
+  # GitHub's repository_dispatch API -- real-time broker signal instead
+  # of waiting for the next poll. See emqx_events.jsonl for the logged
+  # history of what arrives here.
+  repository_dispatch:
+    types: [emqx_event]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -q paho-mqtt
+      # MQTT_CHECK_USER/PASS: repo Settings -> Secrets and variables ->
+      # Actions. Never committed in plaintext.
+      - run: python3 check_and_render.py
+        env:
+          MQTT_CHECK_USER: ${{ secrets.MQTT_CHECK_USER }}
+          MQTT_CHECK_PASS: ${{ secrets.MQTT_CHECK_PASS }}
+      # Points mqtt.rivi.my.id at whichever broker is currently healthy.
+      # Deliberately only runs here, in GitHub Actions, never on the
+      # LXC-side timer -- broker selection keeps working even if the
+      # homelab itself goes offline.
+      - run: python3 update_dns.py
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      # 2026-08-25: log a real EMQX broker event verbatim when this run
+      # was triggered by one, so it becomes part of the committed
+      # history alongside the poll-based check results. Payload shape
+      # isn't hardcoded to specific fields -- EMQX's rule SELECT clause
+      # can be edited later without breaking this.
+      - name: Log EMQX event if this was a repository_dispatch trigger
+        if: github.event_name == 'repository_dispatch'
+        env:
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          python3 -c "
+          import json, os, time
+          entry = {'received_at': time.time(), 'event': json.loads(os.environ['EVENT_PAYLOAD'])}
+          with open('emqx_events.jsonl', 'a') as f:
+              f.write(json.dumps(entry) + '\n')
+          "
+      - name: Skip publish if the LXC already did recently
+        id: guard
+        run: |
+          # The LXC-side timer runs every 2 min and is the primary
+          # publisher; this workflow is only meant to be a fallback for
+          # when the homelab is offline or reacting to a real EMQX
+          # event. 5 min is comfortably more than double the LXC's own
+          # cadence, so a commit that recent means the LXC is clearly
+          # alive and current.
+          last_author=$(git log -1 --format='%an')
+          last_ts=$(git log -1 --format='%at')
+          now=$(date +%s)
+          age=$((now - last_ts))
+          if [ "$last_author" = "meshnodeid-status-lxc" ] && [ "$age" -lt 300 ]; then
+            echo "LXC published ${age}s ago -- skipping, it's already current"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit and push if changed
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          TZ: Asia/Jakarta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html history state.json log.jsonl brokers.json notice.json emqx_events.jsonl
+          if git diff --cached --quiet; then
+            echo "no changes to publish"
+            exit 0
+          fi
+          git commit -m "Update status $(date +%Y-%m-%dT%H:%M:%S%z) WIB"
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push rejected (attempt $i), rebasing onto origin/main and retrying"
+            git fetch origin main
+            git rebase -X ours origin/main
+          done
+          echo "failed to push after 3 attempts"
+          exit 1
