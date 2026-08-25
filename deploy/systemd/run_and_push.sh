@@ -31,6 +31,14 @@ set -euo pipefail
 
 MQTT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BOT_DIR="$(dirname "$MQTT_DIR")/bot-status"
+# 2026-08-25: resumed publishing here too, per explicit instruction --
+# the new meshnodeid-status/bot-status split is a side project for now,
+# this is still the actively-checked page day to day. Kept in sync by
+# copying the SAME already-computed output from MQTT_DIR/BOT_DIR rather
+# than re-running the real network checks a third time (which could
+# read slightly different live broker state than the other two and
+# make the three sites visibly disagree with each other).
+LEGACY_DIR="$(dirname "$MQTT_DIR")/mqtt-status-repo"
 
 # 2026-08-23: discard any leftover uncommitted state before pulling --
 # confirmed live, repeatedly: a dirty tree (always regenerated-output
@@ -58,6 +66,7 @@ _discard_and_pull() {
 
 _discard_and_pull "$MQTT_DIR"
 _discard_and_pull "$BOT_DIR"
+_discard_and_pull "$LEGACY_DIR"
 
 cd "$MQTT_DIR"
 
@@ -107,6 +116,18 @@ cd "$BOT_DIR"
 # docstring for the full LXC-vs-Actions split.
 python3 check_bot_status.py
 
+# 2026-08-25: mirror this cycle's already-computed output into the
+# legacy repo instead of re-running either check script there -- see
+# LEGACY_DIR's comment above for why.
+cp "$MQTT_DIR/index.html" "$MQTT_DIR/uptime.html" "$MQTT_DIR/state.json" \
+   "$MQTT_DIR/log.jsonl" "$MQTT_DIR/brokers.json" "$MQTT_DIR/notice.json" \
+   "$LEGACY_DIR/"
+rm -rf "$LEGACY_DIR/history"
+cp -r "$MQTT_DIR/history" "$LEGACY_DIR/history"
+cp "$BOT_DIR/bot-status.html" "$BOT_DIR/bot_state.json" "$BOT_DIR/bot_log.jsonl" "$LEGACY_DIR/"
+rm -rf "$LEGACY_DIR/bot_history"
+cp -r "$BOT_DIR/bot_history" "$LEGACY_DIR/bot_history"
+
 _commit_and_push() {
     local dir="$1" identity="$2"
     shift 2
@@ -145,6 +166,7 @@ _commit_and_push() {
 
 mqtt_status=0
 bot_status=0
+legacy_status=0
 # emqx_events.jsonl is only ever created by the GitHub Actions side (on
 # a real repository_dispatch from EMQX) -- this box never receives that
 # webhook directly. `git add` on a path that doesn't exist yet is a
@@ -153,12 +175,16 @@ bot_status=0
 # box then pulled).
 touch "$MQTT_DIR/emqx_events.jsonl"
 _commit_and_push "$MQTT_DIR" "meshnodeid-status-lxc" \
-    index.html history state.json log.jsonl brokers.json notice.json emqx_events.jsonl \
+    index.html uptime.html history state.json log.jsonl brokers.json notice.json emqx_events.jsonl \
     || mqtt_status=1
 _commit_and_push "$BOT_DIR" "bot-status-lxc" \
     bot-status.html bot_history bot_state.json bot_log.jsonl brokers.json \
     || bot_status=1
+_commit_and_push "$LEGACY_DIR" "mqtt-status-lxc" \
+    index.html uptime.html history state.json log.jsonl brokers.json notice.json \
+    bot-status.html bot_history bot_state.json bot_log.jsonl \
+    || legacy_status=1
 
-if [ "$mqtt_status" != "0" ] || [ "$bot_status" != "0" ]; then
+if [ "$mqtt_status" != "0" ] || [ "$bot_status" != "0" ] || [ "$legacy_status" != "0" ]; then
     exit 1
 fi
