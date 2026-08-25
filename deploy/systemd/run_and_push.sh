@@ -1,26 +1,36 @@
 #!/bin/bash
-# LXC-side runner for the mqtt-status page -- mirrors .github/workflows/
-# check-status.yml's own check-and-commit logic exactly, just running
-# locally instead of on a GitHub Actions runner.
+# LXC-side runner for the status pages -- mirrors the two GitHub Actions
+# workflows' own check-and-commit logic exactly, just running locally
+# instead of on a GitHub Actions runner.
 #
-# Why this exists alongside the GitHub Actions workflow, not instead of
-# it: this box sits near Indonesia (~5-30ms to these brokers); the
+# 2026-08-25: split from a single mqtt-status-repo into two independent
+# repos (meshnodeid-status for the broker tracker, bot-status for the
+# bot/service tracker) so each can have its own professional custom
+# domain (status.meshnode.id / bot-status.rivi.my.id) via GitHub Pages'
+# native one-CNAME-per-repo support. This script now operates on BOTH
+# checkouts and does two independent commit/push cycles -- one per repo
+# -- instead of the single combined commit it used to do.
+#
+# Why this exists alongside the GitHub Actions workflows, not instead of
+# them: this box sits near Indonesia (~5-30ms to these brokers); the
 # Actions runner is on US/EU infra (~600-750ms to the same brokers,
 # confirmed 2026-08-19). Running the check from here gives accurate
 # latency numbers and a much tighter check interval whenever this box is
-# up. THIS side is the primary publisher; check-status.yml's own "Skip
-# publish if the LXC already did recently" step (added 2026-08-22) makes
-# it defer to whatever this script just pushed, only actually publishing
-# when this box has been quiet for a while -- that's what makes it a
-# real fallback instead of two independent writers racing each other
-# every cycle (confirmed live: that race was failing the Actions job
-# and emailing failure notifications regularly before the guard existed).
+# up. THIS side is the primary publisher; each workflow's own "Skip
+# publish if the LXC already did recently" step makes it defer to
+# whatever this script just pushed, only actually publishing when this
+# box has been quiet for a while.
 #
-# Commits under a distinct identity (not the "RiV-Bot" identity used for
-# manual/design-work commits, not "github-actions[bot]") so the commit
-# history makes it obvious which system produced which data point.
+# Commits under distinct per-repo identities (not the "RiV-Bot" identity
+# used for manual/design-work commits, not "github-actions[bot]") so the
+# commit history makes it obvious which system produced which data
+# point -- meshnodeid-status-lxc for the broker repo, bot-status-lxc for
+# the bot repo, matching what each repo's own workflow guard step checks
+# for.
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+
+MQTT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+BOT_DIR="$(dirname "$MQTT_DIR")/bot-status"
 
 # 2026-08-23: discard any leftover uncommitted state before pulling --
 # confirmed live, repeatedly: a dirty tree (always regenerated-output
@@ -34,14 +44,22 @@ cd "$(dirname "$0")/../.."
 # whatever is here is always safe -- this is what actually makes the
 # script self-healing against that whole failure class, instead of
 # relying on remembering to `git status` clean before every SSH
-# session ends.
-if [ -n "$(git status --porcelain)" ]; then
-    echo "mqtt-status-lxc: discarding dirty working tree before pull"
-    git checkout --quiet -- .
-    git clean --quiet -fd
-fi
+# session ends. Applied to BOTH checkouts now.
+_discard_and_pull() {
+    local dir="$1"
+    cd "$dir"
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "$(basename "$dir"): discarding dirty working tree before pull"
+        git checkout --quiet -- .
+        git clean --quiet -fd
+    fi
+    git pull --rebase --quiet origin main
+}
 
-git pull --rebase --quiet origin main
+_discard_and_pull "$MQTT_DIR"
+_discard_and_pull "$BOT_DIR"
+
+cd "$MQTT_DIR"
 
 # 2026-08-22: check_and_render.py now does a real authenticated MQTT
 # CONNECT (not just a TCP check) so it can tell "broker down" apart from
@@ -73,17 +91,32 @@ export BOT_LONG_NAME
 
 python3 check_and_render.py
 
+# 2026-08-25: brokers.json is the source of truth here (meshnodeid-
+# status) -- bot-status keeps its own copy only because it runs as a
+# separate top-level script in a separate repo and can't import across
+# checkouts. Sync it over every cycle so adding/removing a tracked
+# broker here doesn't silently drift out of sync with the copy
+# check_bot_status.py reads for its DNS-failover-target note.
+cp "$MQTT_DIR/brokers.json" "$BOT_DIR/brokers.json"
+
+cd "$BOT_DIR"
+
 # 2026-08-22: bot-status.html (mesh_bot/meshtasticd service uptime) --
 # only THIS side can actually check them (local systemd + local API,
 # neither reachable from GitHub Actions). See check_bot_status.py's own
 # docstring for the full LXC-vs-Actions split.
 python3 check_bot_status.py
 
-git add index.html history state.json log.jsonl brokers.json notice.json bot-status.html bot_history bot_state.json bot_log.jsonl
-if git diff --cached --quiet; then
-    echo "mqtt-status-lxc: no changes to publish"
-else
-    git -c user.name="mqtt-status-lxc" -c user.email="lxc@rivbot.local" \
+_commit_and_push() {
+    local dir="$1" identity="$2"
+    shift 2
+    cd "$dir"
+    git add "$@"
+    if git diff --cached --quiet; then
+        echo "$identity: no changes to publish"
+        return 0
+    fi
+    git -c user.name="$identity" -c user.email="lxc@rivbot.local" \
         commit --quiet -m "Update status (LXC) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     # This box is the primary publisher and Actions now defers to it, so
     # a real collision should be rare -- but not impossible right at the
@@ -91,21 +124,41 @@ else
     # margin for that narrow case without this oneshot unit hanging
     # around; -X ours keeps this run's freshly-computed data on
     # conflict, same reasoning as the Actions side.
-    pushed=0
+    local pushed=0
     for i in 1 2; do
         if git push --quiet origin main; then
             pushed=1
             break
         fi
-        echo "mqtt-status-lxc: push rejected (attempt $i), rebasing and retrying"
+        echo "$identity: push rejected (attempt $i), rebasing and retrying"
         git fetch --quiet origin main
-        git -c user.name="mqtt-status-lxc" -c user.email="lxc@rivbot.local" \
+        git -c user.name="$identity" -c user.email="lxc@rivbot.local" \
             rebase --quiet -X ours origin/main
     done
     if [ "$pushed" = "1" ]; then
-        echo "mqtt-status-lxc: published"
+        echo "$identity: published"
     else
-        echo "mqtt-status-lxc: failed to push after retries"
-        exit 1
+        echo "$identity: failed to push after retries"
+        return 1
     fi
+}
+
+mqtt_status=0
+bot_status=0
+# emqx_events.jsonl is only ever created by the GitHub Actions side (on
+# a real repository_dispatch from EMQX) -- this box never receives that
+# webhook directly. `git add` on a path that doesn't exist yet is a
+# hard error under `set -e`, so make sure it exists (empty is fine, and
+# harmless if it already has real content from a prior Actions run this
+# box then pulled).
+touch "$MQTT_DIR/emqx_events.jsonl"
+_commit_and_push "$MQTT_DIR" "meshnodeid-status-lxc" \
+    index.html history state.json log.jsonl brokers.json notice.json emqx_events.jsonl \
+    || mqtt_status=1
+_commit_and_push "$BOT_DIR" "bot-status-lxc" \
+    bot-status.html bot_history bot_state.json bot_log.jsonl brokers.json \
+    || bot_status=1
+
+if [ "$mqtt_status" != "0" ] || [ "$bot_status" != "0" ]; then
+    exit 1
 fi
