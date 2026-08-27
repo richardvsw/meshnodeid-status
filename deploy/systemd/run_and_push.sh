@@ -128,6 +128,28 @@ cp "$BOT_DIR/bot-status.html" "$BOT_DIR/bot_state.json" "$BOT_DIR/bot_log.jsonl"
 rm -rf "$LEGACY_DIR/bot_history"
 cp -r "$BOT_DIR/bot_history" "$LEGACY_DIR/bot_history"
 
+# 2026-08-27: MQTT_DIR/index.html (meshnodeid-status) deliberately has NO
+# bot-status link -- that removal was requested specifically for the
+# professional/official broker page, not this legacy personal site,
+# which still links its own bot same as it always has. Since this copy
+# is the SAME rendered HTML as meshnodeid-status's own page (see comment
+# above -- reused rather than re-rendered so the two sites can't
+# disagree), re-insert the link into just this copy after the fact
+# rather than duplicating check_and_render.py's render logic here.
+python3 - "$LEGACY_DIR/index.html" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    html = f.read()
+old = '<div class="uptime-link"><a href="uptime.html">Lihat riwayat uptime lengkap →</a></div>'
+new = ('<div class="uptime-link"><a href="uptime.html">Lihat riwayat uptime lengkap →</a> '
+       '· <a href="bot-status.html">Status bot →</a></div>')
+if old in html:
+    html = html.replace(old, new, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+PYEOF
+
 _commit_and_push() {
     local dir="$1" identity="$2"
     shift 2
