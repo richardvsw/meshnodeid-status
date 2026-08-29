@@ -89,13 +89,25 @@ export MQTT_CHECK_USER MQTT_CHECK_PASS
 # BOT_LONG_NAME empty, and check_and_render.py falls back to whatever
 # was last persisted in state.json's _meta rather than failing the
 # whole publish over this.
-BOT_LONG_NAME="$(timeout 8 python3 -c "
-from meshtastic.tcp_interface import TCPInterface
-iface = TCPInterface(hostname='localhost')
-name = iface.getMyNodeInfo().get('user', {}).get('longName', '')
-iface.close()
-print(name)
-" 2>/dev/null || true)"
+#
+# 2026-08-30: used to open its own short-lived TCPInterface('localhost',
+# portNumber=4403) connection directly, every single 2-min timer cycle --
+# confirmed live this was THE dominant cause of a real bug: meshtasticd's
+# API server only accepts one client at a time and force-closes whichever
+# was already connected the moment a second one connects, so this line
+# was knocking mesh_bot.py's real, persistent connection offline roughly
+# every 2 minutes, 24/7 (149 forced disconnects counted in a single 2h
+# window). mesh_bot then needs ~15-30s to notice and reconnect, during
+# which any real incoming message is silently lost to it forever (never
+# logged, never retried) even though mqtt_tap.py's separate, persistent,
+# direct broker subscription -- never competing for meshtasticd's single
+# API slot -- always saw it. Now reads the SAME already-live value from
+# rivbot-ui's own public_site.py (port 8090, bot_identity.py's cache,
+# itself fixed the same day to stop doing this) over plain HTTP on
+# localhost -- zero connections to meshtasticd's API port from this
+# script at all.
+BOT_LONG_NAME="$(curl -s --max-time 5 http://127.0.0.1:8090/api/public/status \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('bot_name',''))" 2>/dev/null || true)"
 export BOT_LONG_NAME
 
 python3 check_and_render.py
