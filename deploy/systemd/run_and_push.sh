@@ -30,7 +30,15 @@
 set -euo pipefail
 
 MQTT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-BOT_DIR="$(dirname "$MQTT_DIR")/bot-status"
+# 2026-09-04: BOT_DIR removed -- check_bot_status.py no longer runs from
+# here at all. It used to be a real local check (systemctl is-active,
+# etc.) that this script pulled/ran/committed every 2 minutes; that
+# entire local git push/pull/discard cycle is gone now that the bot's
+# own public API (meshbot.rivi.my.id/api/public/status) is reachable
+# directly, so bot-status's own GitHub Actions workflow polls that on
+# its own schedule instead of depending on this box publishing anything
+# at all. See bot-status repo's check_bot_status.py for the real logic.
+#
 # 2026-08-25: resumed publishing here too, per explicit instruction --
 # the new meshnodeid-status/bot-status split is a side project for now,
 # this is still the actively-checked page day to day. Kept in sync by
@@ -65,7 +73,6 @@ _discard_and_pull() {
 }
 
 _discard_and_pull "$MQTT_DIR"
-_discard_and_pull "$BOT_DIR"
 _discard_and_pull "$LEGACY_DIR"
 
 cd "$MQTT_DIR"
@@ -112,33 +119,17 @@ export BOT_LONG_NAME
 
 python3 check_and_render.py
 
-# 2026-08-25: brokers.json is the source of truth here (meshnodeid-
-# status) -- bot-status keeps its own copy only because it runs as a
-# separate top-level script in a separate repo and can't import across
-# checkouts. Sync it over every cycle so adding/removing a tracked
-# broker here doesn't silently drift out of sync with the copy
-# check_bot_status.py reads for its DNS-failover-target note.
-cp "$MQTT_DIR/brokers.json" "$BOT_DIR/brokers.json"
-
-cd "$BOT_DIR"
-
-# 2026-08-22: bot-status.html (mesh_bot/meshtasticd service uptime) --
-# only THIS side can actually check them (local systemd + local API,
-# neither reachable from GitHub Actions). See check_bot_status.py's own
-# docstring for the full LXC-vs-Actions split.
-python3 check_bot_status.py
-
-# 2026-08-25: mirror this cycle's already-computed output into the
-# legacy repo instead of re-running either check script there -- see
-# LEGACY_DIR's comment above for why.
+# 2026-09-04: mirror this cycle's already-computed output into the
+# legacy repo -- bot-status files dropped from this copy (see BOT_DIR
+# removal note above): nothing here generates them anymore, so copying
+# would just be stale-to-stale. The legacy site's own bot-status page
+# link, if it still has one, now points at bot-status.rivi.my.id
+# (published independently by that repo's own GitHub Actions) instead.
 cp "$MQTT_DIR/index.html" "$MQTT_DIR/uptime.html" "$MQTT_DIR/state.json" \
    "$MQTT_DIR/log.jsonl" "$MQTT_DIR/brokers.json" "$MQTT_DIR/notice.json" \
    "$LEGACY_DIR/"
 rm -rf "$LEGACY_DIR/history"
 cp -r "$MQTT_DIR/history" "$LEGACY_DIR/history"
-cp "$BOT_DIR/bot-status.html" "$BOT_DIR/bot_state.json" "$BOT_DIR/bot_log.jsonl" "$LEGACY_DIR/"
-rm -rf "$LEGACY_DIR/bot_history"
-cp -r "$BOT_DIR/bot_history" "$LEGACY_DIR/bot_history"
 
 # 2026-08-27: MQTT_DIR/index.html (meshnodeid-status) deliberately has NO
 # bot-status link -- that removal was requested specifically for the
@@ -199,7 +190,6 @@ _commit_and_push() {
 }
 
 mqtt_status=0
-bot_status=0
 legacy_status=0
 # emqx_events.jsonl is only ever created by the GitHub Actions side (on
 # a real repository_dispatch from EMQX) -- this box never receives that
@@ -211,14 +201,10 @@ touch "$MQTT_DIR/emqx_events.jsonl"
 _commit_and_push "$MQTT_DIR" "meshnodeid-status-lxc" \
     index.html uptime.html history state.json log.jsonl brokers.json notice.json emqx_events.jsonl \
     || mqtt_status=1
-_commit_and_push "$BOT_DIR" "bot-status-lxc" \
-    bot-status.html bot_history bot_state.json bot_log.jsonl brokers.json \
-    || bot_status=1
 _commit_and_push "$LEGACY_DIR" "mqtt-status-lxc" \
     index.html uptime.html history state.json log.jsonl brokers.json notice.json \
-    bot-status.html bot_history bot_state.json bot_log.jsonl \
     || legacy_status=1
 
-if [ "$mqtt_status" != "0" ] || [ "$bot_status" != "0" ] || [ "$legacy_status" != "0" ]; then
+if [ "$mqtt_status" != "0" ] || [ "$legacy_status" != "0" ]; then
     exit 1
 fi
